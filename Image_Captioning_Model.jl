@@ -1,16 +1,16 @@
-for p in ("Knet","ArgParse","AutoGrad","Compat","JLD","DataStructures","Images","MAT")
+for p in ("Knet","ArgParse","AutoGrad","Compat","Images","MAT")
     Pkg.installed(p) == nothing && Pkg.add(p)
 end
-using Knet,AutoGrad,ArgParse,Compat,JLD,DataStructures,Images,MAT
+using Knet,AutoGrad,ArgParse,Compat,Images,MAT
 
 function parse_commandline()
     s = ArgParseSettings()
     @add_arg_table s begin
       ("--datafiles"; nargs='+'; help="If provided, use first file for training, second for dev, others for test.")
       ("--generate"; arg_type=Int; default=500; help="If non-zero generate given number of characters.")
-      ("--hidden";  arg_type=Int; default=4096; help="Sizes of one or more LSTM layers.")
+      ("--hidden";  arg_type=Int; default=200; help="Sizes of one or more LSTM layers.")
       ("--epochs"; arg_type=Int; default=5; help="Number of epochs for training.")
-      ("--embed"; arg_type=Int; default=4096; help="Size of the embedding vector.")
+      ("--embed"; arg_type=Int; default=200; help="Size of the embedding vector.")
       ("--batchsize"; arg_type=Int; default=1; help="Number of sequences to train on in parallel.")
       ("--seqlength"; arg_type=Int; default=1; help="Number of steps to unroll the network for.")
       ("--decay"; arg_type=Float64; default=0.9; help="Learning rate decay.")
@@ -44,7 +44,7 @@ function main(args=ARGS)
       features = VGG.main("flickr30k-images/$idx.jpg")
       get!(images,idx,features)
     end
-    batch_data = minibatch(caps,vocab,opts[:batchsize],images)
+
 
     model = initweights(opts[:atype], opts[:hidden], length(vocab), opts[:winit], opts[:embed])
 
@@ -52,9 +52,12 @@ function main(args=ARGS)
 
     state = initstate(opts[:atype],opts[:hidden],opts[:batchsize])
 
+    batch_data = minibatch(caps,vocab,opts[:batchsize],images)
+    caps = 0; gc(); Knet.knetgc();
+    images = 0; gc(); Knet.knetgc();
     losses = loss(model,copy(state),batch_data)
     println((:epoch,0,:loss,losses...))
-
+    print(sizeof(prms))
     for epoch=1:opts[:epochs]
         @time train(model,prms,copy(state),batch_data;slen = opts[:seqlength],lr = opts[:lr],gclip = opts[:gclip])
         losses = loss(model,copy(state),batch_data)
@@ -63,7 +66,7 @@ function main(args=ARGS)
 end
 
 function process_flickr30k()
-  wordcount = OrderedDict()
+  wordcount = Dict()
   captions = Any[]
   open("results_20130124.token") do f
     for line in readlines(f)
@@ -82,12 +85,12 @@ function process_flickr30k()
   words = keys(wordcount)
   freqs = values(wordcount)
   sorted_idx = sort(collect(zip(freqs,words)))
-  worddict = OrderedDict()
+  worddict = Dict()
   for (index,value) in enumerate(sorted_idx)
       get!(worddict, index, value[2])
       index = index
   end
-  worddict2 = OrderedDict()
+  worddict2 = Dict()
   for (k,v) in worddict
     get!(worddict2,v,length(worddict) + 2 - k)
   end
@@ -106,12 +109,12 @@ function process_flickr30k()
   end
   left_captions = Any[]
   for i=1:length(indexed_captions)
-    if 3 > length(indexed_captions[i][2:end])
+    if 25 > length(indexed_captions[i][2:end])
       push!(left_captions,indexed_captions[i])
     end
   end
   for i = 1:length(left_captions)
-    for j = 1:2-length(left_captions[i][2:end])
+    for j = 1:24-length(left_captions[i][2:end])
       push!(left_captions[i],1)
     end
   end
@@ -122,11 +125,11 @@ end
 function minibatch(indexed_captions,worddict,batchsize,features)
   nbatch = div(length(indexed_captions), batchsize)
   vocab_size = length(worddict)
-  data = [ falses(batchsize*2, vocab_size) for i=1:nbatch ]
+  data = [ falses(batchsize*24, vocab_size) for i=1:nbatch ]
   image = [ zeros(batchsize,1000) for i=1:nbatch]
   for i = 1:batchsize:nbatch
     for m = i:i+batchsize-1
-      for k = 1:2
+      for k = 1:24
         data[i][k,indexed_captions[m][k+1]] = 1
       end
       image[i][batchsize,:] = transpose(features[indexed_captions[m][1]])
@@ -225,6 +228,8 @@ function train(model, prms, state, data; slen=1, lr=1.0, gclip=0.0)
           end
       end
 
+      @time update!(model,gloss,prms)
+      gloss = 0, Knet.knetgc();gc();
       isa(state,Vector{Any}) || error("State should not be Boxed.")
       for i = 1:length(state)
           state[i] = AutoGrad.getval(state[i])
@@ -234,3 +239,4 @@ function train(model, prms, state, data; slen=1, lr=1.0, gclip=0.0)
 end
 
 main()
+
