@@ -1,272 +1,249 @@
-for p in ("Knet","ArgParse","AutoGrad","Compat","Images","MAT","JLD")
-    Pkg.installed(p) == nothing && Pkg.add(p)
+for p in ("ArgParse","JLD","Knet","AutoGrad")
+    if Pkg.installed(p) == nothing; Pkg.add(p); end
 end
-using Knet,AutoGrad,ArgParse,Compat,Images,MAT,JLD
 
-function parse_commandline()
-    s = ArgParseSettings()
-    @add_arg_table s begin
-      ("--saveimages"; default = "flickr8kfeatures.jld"; help="Save conv5 features to file")
-      ("--savecaptions"; default = "flickr8kcaptions.jld"; help="")
-      ("--savefile"; default= "model1.jld"; help="Save final model to file")
-      ("--datafiles"; nargs='+'; help="If provided, use first file for training, second for dev, others for test.")
-      ("--generate"; arg_type=Int; default=15; help="If non-zero generate given number of characters.")
-      ("--hidden";  arg_type=Int; default=1000; help="Sizes of one or more LSTM layers.")
-      ("--epochs"; arg_type=Int; default=20; help="Number of epochs for training.")
-      ("--embed"; arg_type=Int; default=512; help="Size of the embedding vector.")
-      ("--batchsize"; arg_type=Int; default=10; help="Number of sequences to train on in parallel.")
-      ("--seqlength"; arg_type=Int; default=1; help="Number of steps to unroll the network for.")
-      ("--decay"; arg_type=Float64; default=0.9; help="Learning rate decay.")
-      ("--lr"; arg_type=Float64; default=1e-1; help="Initial learning rate.")
-      ("--gclip"; arg_type=Float64; default=3.0; help="Value to clip the gradient norm at.")
-      ("--winit"; arg_type=Float64; default=0.1; help="Initial weights set to winit*randn().")
-      ("--gcheck"; arg_type=Int; default=0; help="Check N random gradients.")
-      ("--seed"; arg_type=Int; default=38; help="Random number seed.")
-      ("--atype"; default=(gpu()>=0 ? "KnetArray{Float32}" : "Array{Float32}"); help="array type: Array for cpu, KnetArray for gpu")
-      ("--dropout"; arg_type=Float64; default=0.5; help="Dropout probability.")
-      ("--selector"; arg_type=Bool; default=true; help="If true select parts of context")
-      ("--prev2out"; arg_type=Bool; default=true; help="Feed previous word into logit" )
-      ("--ctx2out"; arg_type=Bool; default=true; help="Feed weighted context into logit" )
-      ("--alpha_c"; arg_type=Float64; default=0.0; help="Double stochastic regularization coefficient" )
-    end
-    return parse_args(s;as_symbols = true)
-end
-#!isdefined(:VGG) && include("./vgg.jl")
-#using VGG
+#Pkg.update()
+#Pkg.add("AutoGrad")
+#Pkg.checkout("AutoGrad")
+#Pkg.add("Knet")
+#Pkg.checkout("Knet")
+#Pkg.build("Knet")
+
+using ArgParse,JLD,Knet,AutoGrad
+
+!isdefined(:VGG) && include("./vgg.jl")
+using VGG
 
 function main(args=ARGS)
-    opts = parse_commandline()
-    println("opts=",[(k,v) for (k,v) in opts]...)
-    opts[:seed] > 0 && srand(opts[:seed])
-    opts[:atype] = eval(parse(opts[:atype]))
+    s = ArgParseSettings()
+    s.exc_handler=ArgParse.debug_handler
+    @add_arg_table s begin
+        ("--savefile"; help="Save final model to file")
+        ("--loadfile"; default= "modelattdeneme2.jld"; help="Save final model to file")
+        ("--epochs"; arg_type=Int; default=5; help="Number of epochs for training.")
+        ("--hidden"; nargs='+'; arg_type=Int; default=[512]; help="Sizes of one or more LSTM layers.")
+        ("--embed"; arg_type=Int; default=512; help="Size of the embedding vector.")
+        ("--batchsize"; arg_type=Int; default=50; help="Number of sequences to train on in parallel.")
+        ("--optimization"; default="Adam()"; help="Optimization algorithm and parameters.")
+        ("--dropout"; arg_type=Float64; default=0.0; help="Dropout probability.")
+        ("--gcheck"; arg_type=Int; default=0; help="Check N random gradients.")
+        ("--seed"; arg_type=Int; default=-1; help="Random number seed.")
+        ("--atype"; default=(gpu()>=0 ? "KnetArray{Float32}" : "Array{Float32}"); help="array type: Array for cpu, KnetArray for gpu")
+        ("--generate"; arg_type=Int; default=12; help="If non-zero generate given number of characters.")
+    end
+    isa(args, AbstractString) && (args=split(args))
+    o = parse_args(args, s; as_symbols=true)
+    println("opts=",[(k,v) for (k,v) in o]...)
+    if o[:seed] > 0; setseed(o[:seed]); end
+    atype = eval(parse(o[:atype]))
 
-    captions, vocab, maxlen = process_flickr8k()
-    f1 = load("flickr8kfeatures.jld")
-    images = f1["images"]
-    f2 = load("flickr8kcaptions.jld")
-    caps = f2["captions"]
+    global text,vocab,images,ns; (text,vocab),images,ns = loaddata()
+    if o[:loadfile]==nothing
+      global model = model(atype, o[:hidden], length(vocab), o[:embed])
+    else
+      info("Loading model from $(o[:loadfile])")
+      global model = load(o[:loadfile],"model")
+    end
+    bleu_scorer(vocab,o[:generate])
+    global prms  = initparams(model)
+    global data = map(t->minibatch(t, o[:batchsize]), text)
+    global index = map(t->index_images(t), text)
+    epoch = 0
+    losses = report_loss(model,images,index,data[1])
 
-    batch_data = minibatch(caps,vocab,opts[:batchsize],images,maxlen)
-    #caps = 0; gc(); Knet.knetgc();
-    #images = 0; gc(); Knet.knetgc();
+    println("epoch: ", epoch, ", ", "loss", ":", losses)
 
-    model = initweights(opts[:atype], opts[:hidden], length(vocab), opts[:winit], opts[:embed])
+    for epoch=1:o[:epochs]
+        @time train(model, images, index, data[1], prms; pdrop=o[:dropout])
 
-    prms  = initparams(model)
-
-    state = initstate(opts[:atype],opts[:hidden],opts[:batchsize])
-
-    losses = print_loss(model,copy(state),batch_data,opts[:batchsize],opts[:embed],maxlen,images,caps,opts[:dropout],opts[:selector],opts[:ctx2out],opts[:prev2out])
-    println((:epoch,0,:loss,losses...))
-
-
-    for epoch=1:opts[:epochs]
-        @time train(model,prms,copy(state),batch_data,opts[:batchsize],opts[:embed],maxlen,images,caps,opts[:dropout],opts[:selector],opts[:ctx2out],opts[:prev2out];slen = opts[:seqlength],lr = opts[:lr],gclip = opts[:gclip])
-        losses = print_loss(model,copy(state),batch_data,opts[:batchsize],opts[:embed],maxlen,images,caps,opts[:dropout],opts[:selector],opts[:ctx2out],opts[:prev2out])
-        println((:epoch,epoch,:loss,losses...))
-        #=
-        if opts[:gcheck] > 0
-            gradcheck(loss, model, copy(state), batch_data, 1:opts[:seqlength]; gcheck=opts[:gcheck], verbose=true)
+        losses = report_loss(model,images,index,data[1])
+        println("epoch: ", epoch, ", ", "loss", ":", losses)
+        if o[:gcheck] > 0
+            gradcheck(rnnlm, model, rand(data); gcheck=o[:gcheck], verbose=true)
         end
-        =#
     end
 
-    if opts[:generate] > 0
+    if o[:savefile] != nothing
+        save(o[:savefile], "model", model, "vocab", vocab)
+    end
+
+    if o[:generate] > 0
         println("########## SAMPLE CAPTION ############")
-        image_input = VGG.main("Flicker8k_Dataset/72964268_d532bb8ec7.jpg")
-        image_input = reshape(image_input,1,196,512)
-        state = initstate(opts[:atype],opts[:hidden],1)
-        generate(opts[:atype],model, state, vocab, opts[:generate],image_input,opts[:embed],opts[:dropout],opts[:selector],opts[:ctx2out],opts[:prev2out])
-    end
-    #=
-    if opts[:savefile] != nothing
-      info("Saving final model to $(opts[:savefile])")
-      for i =1:length(model); model[i] = convert(Array{Float32},model[i]); print(typeof(model[i]));end
-      save(opts[:savefile], "model", model, "vocab", vocab)
-    end
-    =#
-end
-
-function process_flickr30k()
-  wordcount = Dict()
-  captions = Any[]
-  open("results_20130124.token") do f
-    for line in readlines(f)
-        caption = split(line,['#',' ','\n','\t','.'])
-        deleteat!(caption, findin(caption, [""]))
-        cap = caption
-        push!(captions,cap)
-        for word in caption[4:end]
-          if ~haskey(wordcount,word)
-            get!(wordcount,word,0)
-          end
-          wordcount[word] += 1
+        for key in keys(images)
+          idx = key
+          image_input = VGG.main("Flicker8k_Dataset/$idx.jpg")
+          image = reshape(image_input,1,196,512)
+          generate(vocab,image,o[:generate])
         end
     end
-  end
-  words = keys(wordcount)
-  freqs = values(wordcount)
-  sorted_idx = sort(collect(zip(freqs,words)))
-  worddict = Dict()
-  for (index,value) in enumerate(sorted_idx)
-      get!(worddict, index, value[2])
-      index = index
-  end
-  worddict2 = Dict()
-  for (k,v) in worddict
-    get!(worddict2,v,length(worddict) + 2 - k)
-  end
-  #get!(worddict2,"<eos>",1)
-  get!(worddict2,"UNK",1)
-  indexed_captions = Any[]
-  for i =1:length(captions)
-    sentence = captions[i][4:end]
-    cc =  Any[]
-    push!(cc,parse(Int,captions[i][1]))
-    for j = 1:length(sentence)
-      word_index = worddict2[sentence[j]]
-      push!(cc,word_index)
-    end
-    push!(indexed_captions,cc)
-  end
-  maxlen = 16
-  left_captions = Any[]
-  for i=1:length(indexed_captions)
-    if maxlen+1 > length(indexed_captions[i][2:end])
-      push!(left_captions,indexed_captions[i])
-    end
-  end
-  for i = 1:length(left_captions)
-    for j = 1:(maxlen-1)-length(left_captions[i][2:end])
-      push!(left_captions[i],1)
-    end
-  end
 
-  return left_captions, worddict2, maxlen
 end
 
-function process_flickr8k()
-  wordcount = Dict()
-  captions = Any[]
-  open("Flickr8k.token.txt") do f
-    for line in readlines(f)
-        caption = split(line,['#',' ','\n','\t','.'])
-        deleteat!(caption, findin(caption, [""]))
-        cap = caption
-        push!(captions,cap)
-        for word in caption[4:end]
-          if ~haskey(wordcount,word)
-            get!(wordcount,word,0)
-          end
-          wordcount[word] += 1
-        end
-    end
-  end
-  words = keys(wordcount)
-  freqs = values(wordcount)
-  sorted_idx = sort(collect(zip(freqs,words)))
-  worddict = Dict()
-  for (index,value) in enumerate(sorted_idx)
-      get!(worddict, index, value[2])
-      index = index
-  end
-  worddict2 = Dict()
-  for (k,v) in worddict
-    get!(worddict2,v,length(worddict) + 2 - k)
-  end
-  #get!(worddict2,"<eos>",1)
-  get!(worddict2,"UNK",1)
-  indexed_captions = Any[]
-  for i =1:length(captions)
-    sentence = captions[i][4:end]
-    cc =  Any[]
-    push!(cc,captions[i][1])
-    for j = 1:length(sentence)
-      word_index = worddict2[sentence[j]]
-      push!(cc,word_index)
-    end
-    push!(indexed_captions,cc)
-  end
-  maxlen = 16
-  left_captions = Any[]
-  for i=1:length(indexed_captions)
-    if maxlen > length(indexed_captions[i][2:end])
-      push!(left_captions,indexed_captions[i])
-    end
-  end
-  for i = 1:length(left_captions)
-    for j = 1:(maxlen-1)-length(left_captions[i][2:end])
-      push!(left_captions[i],1)
-    end
-  end
-  #=
-  image_indexes = Any[]
-  open("Flickr_8k.trainImages.txt") do f
-    for line in readlines(f)
-      line = split(line,['\n','.'])
-      deleteat!(line, findin(line, [""]))
-      deleteat!(line, findin(line, ["jpg"]))
-      push!(image_indexes,line)
-    end
-  end
-  =#
-  return left_captions, worddict2, maxlen
-end
+function loaddata()
+    f = load("flickr8kconv5.jld")
+    images = f["features"]
+    data = Any[]
+    wordcount = Dict()
 
-function minibatch(indexed_captions,worddict,batchsize,features,maxlen)
-  nbatch = div(length(indexed_captions), batchsize) * (maxlen-1)
-  vocab_size = length(worddict)
-  data = [ falses(batchsize, vocab_size) for i=1:nbatch ]
-  batch = 1
-  for i = 1:batchsize:nbatch
-    for m = i:i+batchsize-1
-      for k = 1:(maxlen-1)
-        data[batch+k-1][m-i+1,indexed_captions[m][k+1]] = 1
+    open("Flickr_8k.trainImages.txt") do f
+      global train_set = Any[]
+      for line in eachline(f)
+        push!(train_set,line[1:end-5])
       end
     end
-    batch += (maxlen-1)
-    if batch > nbatch
-      break
+
+    open("Flickr8k.token.txt") do f
+        captions = Any[]
+        for line in eachline(f)
+            c = split(lowercase(line),['#',' ','\n','\t','.'])
+            deleteat!(c, findin(c, [""]))
+            cap = c
+            push!(captions,cap)
+            for word in c[4:end]
+              if ~haskey(wordcount,word)
+                get!(wordcount,word,0)
+              end
+              wordcount[word] += 1
+            end
+        end
+        words = keys(wordcount)
+        freqs = values(wordcount)
+        sorted = sort(collect(zip(freqs,words)))
+
+        sent = Any[]
+        for i = 1:length(captions)
+          cc = captions[i]
+          for j = 4:length(cc)
+            if wordcount[cc[j]] <= 5
+              cc[j] = "<unk>"
+            end
+          end
+          push!(sent,cc)
+        end
+        global BOS = 1
+        global EOS = 2
+        global ns = 0
+        vocab = Dict()
+        get!(vocab,".",EOS); get!(vocab,"<s>",BOS)
+
+        d = Any[]; nw = 0
+        for i = 1:length(sent)
+            caption = sent[i]
+            if haskey(images,caption[1]) == true && findin(train_set,[caption[1]]) != []
+              if length(caption[4:end])<=22
+                s = Any[]; ns+=1
+                push!(s, caption[1])
+                for word in caption[4:end]
+                    push!(s, get!(vocab, word, 1+length(vocab))); nw+=1
+                end
+                push!(d, s)
+              #else
+              #  s = Any[]; ns+=1
+              #  push!(s, caption[1])
+              #  for word in caption[4:25]
+              #      push!(s, get!(vocab, word, 1+length(vocab))); nw+=1
+              #  end
+              #  push!(d, s)
+              end
+            end
+        end
+        push!(data, d)
     end
-  end
-  return data
+    global PAD = length(vocab)+1
+
+    return (data, vocab),images,ns
 end
 
-function initweights(atype, hidden, vocab, winit, embed)
-  model = Array(Any, 17)
-  param = Dict()
-  model[1] = winit*randn(embed, 4*hidden)
-  model[2] = winit*randn(hidden, 4*hidden)
-  model[3] = zeros(1, 4*hidden)
-  #model[2][1:hidden] = 1
-  #encoding
-  model[4] = winit*randn(vocab,embed)
-  #decoding
-  model[5] = winit*randn(hidden,embed)
-  model[6] = zeros(1,embed)
-  model[7] = winit*randn(embed,vocab)
-  model[8] = zeros(1,vocab)
-  #projection
-  model[9] = winit*randn(512,512)
-  #attention
-  model[10] = winit*randn(hidden,512)
-  model[11] = zeros(1,512)
-  model[12] = winit*randn(512,1)
-  model[13] = zeros(1,1)
-  #
-  model[14] = winit*randn(512,4*hidden)
-  #selector
-  model[15] = winit*randn(hidden,1)
-  model[16] = zeros(1,1)
-  #ctx2out
-  model[17] = winit*randn(512,embed)
+function minibatch(data, batchsize)
 
-  for k = 1:17
-    get!(param, k, model[k])
-  end
-  # your code ends here
-  for k in keys(param); param[k] = convert(atype, param[k]); end
-  return param
+    data = sort(data, by=length)
+    sequence = Any[]
+    for i = 1:length(data)
+      push!(sequence,data[i][2:end])
+    end
+    nbuckets = Int32(floor(length(sequence)/batchsize))
+    bos = Int32[]
+
+    for i = 1:batchsize
+      push!(bos,BOS)
+    end
+    buckets = Any[]
+    for k = 1:nbuckets
+        d = sequence[(k-1)*batchsize+1:k*batchsize]
+        bucket = Any[]
+        push!(bucket,bos)
+        for j = 1:length(d[end])+1
+          words = Int32[]
+          for i = 1:length(d)
+            if j-1 == length(d[i])
+              push!(words,EOS)
+            elseif j-2 >= length(d[i])
+              push!(words,PAD)
+            elseif length(d[i]) >= j
+              push!(words,d[i][j])
+            end
+          end
+          push!(bucket,words)
+        end
+        push!(buckets,bucket)
+    end
+    #=
+    for i=1:length(buckets)
+      println(length(buckets[i]))
+    end
+    =#
+    return buckets
+end
+
+function index_images(data)
+    data = sort(data, by=length)
+    output = Any[]
+    for i = 1:length(data)
+      push!(output,data[i][1])
+    end
+    return output
+end
+
+function model(atype, hidden, vocab, embed)
+    init(d...)=atype(xavier(Float32,d...))
+    bias(d...)=atype(zeros(Float32,d...))
+    model = Array(Any, 19)
+    param = Dict()
+    # Embedding matrix
+    model[1] = init(embed,vocab+1)
+    # LSTM
+    H = hidden[end]
+    model[2]   = init(4H,H+embed+512)
+    model[3] = bias(4H,1)
+    model[3][1:H] = 1
+    #Decoding
+    model[4] = init(vocab,embed)
+    model[5] = bias(vocab,1)
+    model[6] = init(512,512)
+    #att
+    model[7] = init(512,hidden[end])
+    model[8] = bias(512,1)
+    model[9] = init(512,1)
+    model[10] = bias(1,1)
+    #selector
+    model[11] = init(1,hidden[end])
+    model[12] = bias(1,1)
+    #initial_hidden/memory
+    model[13]=init(512,hidden[end])
+    model[14]=bias(1,hidden[end])
+    model[15]=init(512,hidden[end])
+    model[16]=bias(1,hidden[end])
+    #decoding
+    model[17]=init(embed,hidden[end])
+    model[18]=bias(embed,1)
+    #ctx2out
+    model[19]=init(embed,512)
+
+    for k = 1:19
+      get!(param, k, model[k])
+    end
+    for k in keys(param); param[k] = convert(atype, param[k]); end
+    return param
 end
 
 function initparams(model)
@@ -277,190 +254,324 @@ function initparams(model)
     return prms
 end
 
-function initstate(atype,hidden,batchsize)
-  state = Array(Any, 2*length(hidden))
-  state[1] = zeros(batchsize,hidden)
-  state[2] = zeros(batchsize,hidden)
-  return map(s->convert(atype,s), state)
-end
-
-function project_features(atype, model, input, batchsize,embed)
-  input = reshape(input,batchsize*196,512)
-  projected_features = input * model[9]
-  projected_features = reshape(projected_features,batchsize,196,512)
-  return projected_features
-end
-
-function attention(atype, model, state, image_input, projected_features, batchsize)
-   att = state[1] * model[10] .+ model[11]
-   projected_features = convert(Array{Float32},projected_features)
-   att = convert(Array{Float32},att)
-   attention_input = tanh(projected_features .+ reshape(att,batchsize,1,512))
-   attention_input = convert(atype,attention_input)
-   attention_output = reshape((reshape(attention_input,batchsize*196,512) * model[12]).+model[13],batchsize,196)
-
-   alpha = exp(attention_output) ./ sum(exp(attention_output),2)
-
-   alpha2 = convert(Array{Float32},reshape(alpha,batchsize,196,1))
-   input = convert(Array{Float32},image_input)
-   ctx = sum((input .* alpha2),2)
-   ctx = reshape(ctx,batchsize,512)
-   return alpha, convert(atype,ctx)
-end
-
-function lstm(model,hidden,cell,word_embed,context)
-    gates   = word_embed*model[1] + hidden*model[2] .+ model[3] + context*model[14]
-    hsize   = size(hidden,2)
-    forget  = sigm(gates[:,1:hsize])
-    ingate  = sigm(gates[:,1+hsize:2hsize])
-    outgate = sigm(gates[:,1+2hsize:3hsize])
-    change  = tanh(gates[:,1+3hsize:end])
+function lstm(weight,bias,hidden,cell,input)
+    gates   = weight * vcat(hidden, input) .+ bias
+    h       = size(hidden,1)
+    forget  = sigm(gates[1:h,:])
+    ingate  = sigm(gates[1+h:2h,:])
+    outgate = sigm(gates[1+2h:3h,:])
+    change  = tanh(gates[1+3h:4h,:])
     cell    = cell .* forget + ingate .* change
     hidden  = outgate .* tanh(cell)
     return (hidden,cell)
 end
 
-function predict(atype,model,state,image_input,prev_word,batchsize,embed,prob_dropout,selector,ctx2out,prev2out)
-  word_embed = prev_word * model[4]
-  #Projection
-  projected_features = project_features(atype,model, image_input, batchsize,embed)
-  #Attention_Layer
-  alpha, context = attention(atype,model, state, image_input, projected_features, batchsize)
-  if selector
-    beta = state[1] * model[15] .+ model[16]
-    context = beta .* context
-  end
-  (state[1],state[2]) = lstm(model,state[1],state[2],word_embed,context)
-  #state[1] = state[1] .* (rand!(similar(AutoGrad.getval(state[1]))) .> prob_dropout) * (1/(1-prob_dropout))
-  logits = state[1]*model[5] .+ model[6]
-  if ctx2out
-    logits += context * model[17]
-  end
-  if prev2out
-    logits += word_embed
-  end
-  #logits = tanh(logits) .* (rand!(similar(AutoGrad.getval(tanh(logits)))) .> prob_dropout) * (1/(1-prob_dropout))
-  words = tanh(logits)*model[7] .+ model[8]
-  return words,alpha
+function attention(model, sequence, image; pdrop=0.0)
+    batch = length(sequence[1])
+
+    mean_image = mean(image,2); mean_image = reshape(mean_image,batch,512)
+    h = tanh(mean_image*model[13].+ model[14]); h = h'
+    c = tanh(mean_image*model[15].+ model[16]); c = c'
+    total = count = 0
+    image_input = reshape(image,batch*196,512)
+    projected_features = image_input * model[6]
+    projected_features = reshape(projected_features,batch,196,512)
+
+    for t = 1:length(sequence)-1
+
+        att = model[7] * h .+ model[8]; att = reshape(att,batch,1,512)
+        attention_input = reshape(tanh(projected_features .+ att),batch*196,512)
+        attention_output = reshape(attention_input * model[9] .+ model[10],batch,196)
+
+        attention_output = exp(attention_output)
+        alpha = attention_output ./ sum(attention_output,2)
+        alpha2 = reshape(alpha,batch,196,1)
+        ctx = sum((image .* alpha2),2)
+        ctx = reshape(ctx,batch,512); ctx = ctx'
+
+        #selector
+        beta =  sigm(model[11] * h .+ model[12])
+        ctx = ctx .* beta
+        input = model[1][:,sequence[t]]
+
+        input = vcat(input,ctx)
+        #LSTM
+        (h,c) = lstm(model[2],model[3],h,c,input)
+
+        h = dropout(h,pdrop)
+
+        logits = model[17] * h .+ model[18]
+        #ctx2out/prev2out
+        logits += model[19] * ctx; logits += model[1][:,sequence[t]]
+        logp0 = model[4] * tanh(logits) .+ model[5]
+
+        logp1 = logp(logp0,1)
+        golds = sequence[t+1]
+        index = golds + size(logp1,1)*(0:(length(golds)-1))
+        index = index[golds .!= PAD]
+        logp2 = logp1[index]
+        total += sum(logp2)
+        count += length(index)
+    end
+    return -total/count
 end
 
-function generate(atype,model,state,vocab,nchar,image_input,embed,prob_dropout,selector,ctx2out,prev2out)
-  index_to_char = Array(String, length(vocab))
-  for (k,v) in vocab; index_to_char[v] = k; end
-  input = oftype(state[1], zeros(1,length(vocab)))
-  index = 1
-  image_input = convert(atype,image_input)
-  for t in 1:nchar
-    ypred,_ = predict(atype,model,state,image_input,input,1,embed,prob_dropout,selector,ctx2out,prev2out)
-    input[index] = 0
-    index = sample(exp(logp(ypred)))
-    println(index_to_char[index])
-    input[index] = 1
+function report_loss(model, images, index, data)
+    ind = 0
+    a = 0
+    total = 0
+    for sequence in data
+        batch = length(sequence[1])
+        image = zeros(Float32,batch,196,512)
+        for i = ind:ind+batch-1
+          j = (i+1) % batch
+          if j == 0; j = batch; end
+          image[j,:,:] = images[index[1][i+1]]
+        end
+        ind += batch
+        image = convert(KnetArray{Float32},image)
+        total += attention(model, sequence, image)
+        a += 1
+    end
+    return -total/a
+end
+
+attentiongrad = grad(attention)
+
+function train(model, images, index, data, prms; pdrop=0.0)
+    ind = 0
+    for sequence in data
+        batch = length(sequence[1])
+        image = zeros(Float32,batch,196,512)
+        for i = ind:ind+batch-1
+          j = (i+1) % batch
+          if j == 0; j = batch; end
+          image[j,:,:] = images[index[1][i+1]]
+        end
+        ind += batch
+        image = convert(KnetArray{Float32},image)
+        grads = attentiongrad(model, sequence, image; pdrop=pdrop)
+        update!(model, grads, prms)
+    end
+end
+
+function beam_search(vocab,image,nword,f_candidate)
+  index_to_word = Array(String, length(vocab))
+  for (k,v) in vocab; index_to_word[v] = k; end
+  #input = oftype(state[1], ones(15,1))
+  beam_width = 1
+  word = 1
+  flag2 = true
+  prev_prob = 1.0
+
+  input = 1
+  batch = 1
+
+  image = convert(KnetArray{Float32},image)
+  mean_image = mean(image,2); mean_image = reshape(mean_image,batch,512)
+  h = tanh(mean_image*model[13].+ model[14]); h = h'
+  c = tanh(mean_image*model[15].+ model[16]); c = c'
+  total = count = 0
+  image_input = reshape(image,batch*196,512)
+  projected_features = image_input * model[6]
+  projected_features = reshape(projected_features,batch,196,512)
+
+  while word <= nword
+    if word == 1
+      global new_sequence = zeros(Float32,beam_width^1,word+1)
+    else
+      global new_sequence = zeros(Float32,beam_width^2,word+1)
+    end
+    seq_len = 1
+
+    while flag2 && seq_len <= beam_width
+
+      if word != 1
+        input = old_sequence[seq_len,end-1]
+        prev_prob = old_sequence[seq_len,end]
+        prev_cap = reshape(old_sequence[seq_len,1:end-1],1,size(old_sequence)[2]-1)
+        for i = 1:beam_width-1
+          prev_cap = vcat(prev_cap,reshape(old_sequence[seq_len,1:end-1],1,size(old_sequence)[2]-1))
+        end
+      end
+
+      att = model[7] * h .+ model[8]; att = reshape(att,batch,1,512)
+      attention_input = reshape(tanh(projected_features .+ att),batch*196,512)
+      attention_output = reshape(attention_input * model[9] .+ model[10],batch,196)
+
+      attention_output = exp(attention_output)
+      alpha = attention_output ./ sum(attention_output,2)
+      alpha2 = reshape(alpha,batch,196,1)
+      ctx = sum((image .* alpha2),2)
+      ctx = reshape(ctx,batch,512); ctx = ctx'
+
+      #selector
+      beta =  sigm(model[11] * h .+ model[12])
+      ctx = ctx .* beta
+      emb = model[1][:,input]
+
+      inp = vcat(emb,ctx)
+      #LSTM
+      (h,c) = lstm(model[2],model[3],h,c,inp)
+
+      logits = model[17] * h .+ model[18]
+      #ctx2out/prev2out
+      logits += model[19] * ctx
+      emb = reshape(emb,512,1)
+      logits += emb
+      logp0 = model[4] * tanh(logits) .+ model[5]
+
+      logp1 = logp(logp0,1)
+      p= reshape(convert(Array{Float32},exp(logp1)),length(vocab))
+
+      index = sortperm(p,rev=true)[1:beam_width]
+      prob = p[index]*prev_prob
+
+      if word == 1
+        new_sequence[1:beam_width,:] = hcat(index,prob)
+      else
+        index = hcat(prev_cap,index)
+        new_sequence[beam_width*(seq_len-1)+1:beam_width*(seq_len+1)-beam_width,:] = hcat(index,prob)
+      end
+
+      if word == 1
+        flag2 = false
+      end
+
+      seq_len += 1
+
+    end
+    flag2 = true
+    word += 1
+    ind = sortperm(new_sequence[:,end],rev=true)
+    old_sequence = new_sequence[ind[1:beam_width],:]
+
   end
+
+  i = findmax(new_sequence[:,end])
+  sampled_caption = new_sequence[i[2],1:end-1]
+  for j = 1:length(sampled_caption)
+    print(index_to_word[convert(Int,sampled_caption[j])])
+    print(" ")
+    sample_word = index_to_word[convert(Int,sampled_caption[j])]
+    write(f_candidate,"$sample_word ")
+  end
+  write(f_candidate,"\n")
+end
+
+
+function bleu_scorer(vocab,nword)
+  f = load("flickr8kconv5.jld")
+  images = f["features"]
+  open("Flickr_8k.devImages.txt") do f
+    global dev_set = Any[]
+    for line in eachline(f)
+      push!(dev_set,line[1:end-5])
+    end
+  end
+
+  references= []
+  for i = 1:5
+    i -= 1
+    push!(references,open("./ref$i","w"))
+  end
+  open("Flickr8k.token.txt") do f
+    captions = Any[]
+    for line in eachline(f)
+      c = split(lowercase(line),['#',' ','\n','\t','.'])
+      deleteat!(c, findin(c, [""]))
+      push!(captions,c)
+    end
+    for i = 1:length(dev_set)
+      for j = 1:length(captions)
+        c = captions[j]
+        if findin(c,[dev_set[i]]) != []
+          for k = 1:length(c[4:end])
+            write(references[parse(Int,c[3])+1],c[k+3])
+            write(references[parse(Int,c[3])+1]," ")
+          end
+          write(references[parse(Int,c[3])+1],"\n")
+        end
+      end
+    end
+  end
+  for i = 1:length(references); close(references[i]);end
+
+
+  f_candidate = open("flickr8k_candidate","w")
+  for i = 1:length(dev_set)
+    image_input = images[dev_set[i]]
+    image = reshape(image_input,1,196,512)
+    generate(vocab,image,nword,f_candidate)
+    println()
+  end
+  close(f_candidate)
+
+  run(pipeline(`perl multi-bleu.perl ./ref`, stdin="flickr8k_candidate"))
+
+end
+
+
+function generate(vocab,image,nword,f_candidate)
+  index_to_word = Array(String, length(vocab))
+  for (k,v) in vocab; index_to_word[v] = k; end
+
+  input = 1
+  batch = 1
+
+  image = convert(KnetArray{Float32},image)
+  mean_image = mean(image,2); mean_image = reshape(mean_image,batch,512)
+  h = tanh(mean_image*model[13].+ model[14]); h = h'
+  c = tanh(mean_image*model[15].+ model[16]); c = c'
+  total = count = 0
+  image_input = reshape(image,batch*196,512)
+  projected_features = image_input * model[6]
+  projected_features = reshape(projected_features,batch,196,512)
+
+  for t = 1:nword
+
+    att = model[7] * h .+ model[8]; att = reshape(att,batch,1,512)
+    attention_input = reshape(tanh(projected_features .+ att),batch*196,512)
+    attention_output = reshape(attention_input * model[9] .+ model[10],batch,196)
+
+    attention_output = exp(attention_output)
+    alpha = attention_output ./ sum(attention_output,2)
+    alpha2 = reshape(alpha,batch,196,1)
+    ctx = sum((image .* alpha2),2)
+    ctx = reshape(ctx,batch,512); ctx = ctx'
+
+    #selector
+    beta =  sigm(model[11] * h .+ model[12])
+    ctx = ctx .* beta
+    emb = model[1][:,input]
+
+    inp = vcat(emb,ctx)
+    #LSTM
+    (h,c) = lstm(model[2],model[3],h,c,inp)
+
+    logits = model[17] * h .+ model[18]
+    #ctx2out/prev2out
+    logits += model[19] * ctx
+    emb = reshape(emb,512,1)
+    logits += emb
+    logp0 = model[4] * tanh(logits) .+ model[5]
+
+    logp1 = logp(logp0,1)
+    
+    index = sample(exp(logp1))
+    print(index_to_word[index])
+    print(" ")
+    sample_word = index_to_word[index]
+    write(f_candidate,"$sample_word ")
+    input = index
+  end
+  write(f_candidate,"\n")
 end
 
 function sample(p)
-    p = convert(Array,p)
-    r = rand()
-    for c = 1:length(p)
-        r -= p[c]
-        r < 0 && return c
-    end
+    index = findmax(convert(Array{Float32},p))[2]
+    return index
 end
-
-function loss(model,state,sentence,image,batchsize,embed,range,index,prob_dropout,selector,ctx2out,prev2out)
-    total = 0.0; count = 0
-    atype = KnetArray{Float32}
-    prev_word = convert(atype,sentence[first(range)])
-    #alphas = Any[]
-    for t in range
-      image_input = convert(atype,image)
-      ypred,alpha = predict(atype,model,state,image_input,prev_word,batchsize,embed,prob_dropout,selector,ctx2out,prev2out)
-      #push!(alphas,alpha)
-      ynorm = logp(ypred,2)
-      ygold = sentence[t+1]
-      ygold = convert(atype,ygold)
-      total += sum(ygold .* ynorm)
-      count += size(ygold,1)
-      prev_word = ygold
-    end
-
-
-    return -total / count
-end
-
-lossgradient = grad(loss);
-
-function print_loss(model, state, data, batchsize,embed,maxlen,features,caps,prob_dropout,selector,ctx2out,prev2out)
-  sentence = data
-
-  index = 1
-  l = 0
-  count = 0
-  #nbatch_image = div(length(indexed_captions), batchsize)
-  #image = [ zeros(batchsize,196,512) for i=1:nbatch_image]
-
-  #=
-  for i = 1:batchsize:nbatch_image
-    for m = i:i+batchsize-1
-      image[i][m-i+1,:,:] = features[indexed_captions[m][1]]
-    end
-  end
-  =#
-
-
-  #for t = 1:maxlen:length(sentence)-maxlen
-  for t = 1:maxlen:160
-    #print(index)
-    image = zeros(batchsize,196,512)
-    for m = index:index+batchsize-1
-      image[m-index+1,:,:] = features[caps[m][1]]
-    end
-    range = t:t+maxlen-1
-    l += loss(model, state, sentence,image, batchsize,embed, range,index,prob_dropout,selector,ctx2out,prev2out)
-    index += batchsize
-    count += 1
-
-  end
-
-  return -l/count
-end
-
-function train(model, prms, state, data, batchsize,embed,maxlen,features,caps,prob_dropout,selector,ctx2out,prev2out; slen=1, lr=1.0, gclip=0.0)
-  sentence = data
-  index = 1
-  #for t = 1:maxlen:length(sentence)-maxlen
-  for t = 1:maxlen:160
-      #print(index)
-      image = zeros(batchsize,196,512)
-      for m = index:index+batchsize-1
-        image[m-index+1,:,:] = features[caps[m][1]]
-      end
-      range = t:t+maxlen-1
-      gloss = lossgradient(model, state, sentence,image, batchsize,embed, range,index,prob_dropout,selector,ctx2out,prev2out)
-
-      index += batchsize
-      gnorm = 0
-      for k in keys(model)
-          gnorm += sum(gloss[k].^2);
-      end
-      gnorm = sqrt(gnorm)
-
-      if gnorm >gclip
-          for k in keys(model)
-            gloss[k] = (gloss[k] * gclip ) / gnorm
-          end
-      end
-
-      update!(model,gloss,prms)
-
-      isa(state,Vector{Any}) || error("State should not be Boxed.")
-      for i = 1:length(state)
-          state[i] = AutoGrad.getval(state[i])
-      end
-
-  end
-end
-
 
 main()
+
